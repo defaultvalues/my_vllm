@@ -54,7 +54,7 @@ class Request:
 
     def step(self, next_token):
         self.generated.append(next_token.item())
-        if len(self.generated) >= self.max_new_tokens:
+        if len(self.generated) >= self.max_new_tokens or next_token.item() == tokenizer.eos_token_id:
             self.finished = True
 
     def get_output(self):
@@ -118,9 +118,9 @@ async def scheduler():
                     req_kv_list = []
                     
                     # 遍历每一层（指模型的每一层 注意力 模块），提取对应请求的 KV
-                    for layer_idx in range(len(past)):
+                    for past_layer in past:
                         # 提取第 i 个请求的 Key 和 Value
-                        k_layer, v_layer = past[layer_idx]  # k_layer, v_layer: (B, num_heads, seq_len, head_dim)
+                        k_layer, v_layer = past_layer[0], past_layer[1]  # k_layer, v_layer: (B, num_heads, seq_len, head_dim)
                         k_i = k_layer[i:i+1, :, :actual_len, :].clone()  # 取第 i 个请求的 KV
                         v_i = v_layer[i:i+1, :, :actual_len, :].clone()
                         req_kv_list.append((k_i, v_i))
@@ -152,37 +152,41 @@ async def scheduler():
             # 1. 准备 input_ids [Batch, 1]
             input_ids = torch.stack([req.input_ids[-1:] for req in decode_queue]).to(device)
 
-            # 2. 准备 Batch 化的 KV Cache 和 Attention Mask
-            batch_past_key_values = []
+            # --- 准备 Batch 化的 KV Cache 和 Attention Mask ---
+
+            # 1. 创建空的 DynamicCache 对象
+            batched_past = DynamicCache()
+
+            # 2. 拼接每一层的 Batch KV
             num_layers = len(decode_queue[0].KV_cache)
-            
-            # 计算当前 Batch 中所有请求的总长度（历史 KV 长度 + 1个新输入）
-            # 注意：每个请求的 KV 长度可能不同
             current_kv_lens = [req.KV_cache[0][0].size(2) for req in decode_queue]
             max_kv_len = max(current_kv_lens)
-            
-            # 构建每一层的 Batch KV
+
             for layer_idx in range(num_layers):
-                keys = []
-                values = []
+                keys_to_cat = []
+                values_to_cat = []
+                
                 for i, req in enumerate(decode_queue):
-                    k, v = req.KV_cache[layer_idx] # [1, num_heads, req_kv_len, head_dim]
+                    k, v = req.KV_cache[layer_idx] # 每个 req 的 KV 是 [1, H, S, D]
                     
-                    # 对齐序列长度 (Padding at dim=2)
+                    # 对齐长度（右填充）
                     pad_len = max_kv_len - k.size(2)
                     if pad_len > 0:
-                        # 使用右填充，保持注意力机制逻辑一致
-                        pad_k = torch.zeros((1, k.size(1), pad_len, k.size(3)), device=device, dtype=k.dtype)
-                        pad_v = torch.zeros((1, v.size(1), pad_len, v.size(3)), device=device, dtype=v.dtype)
-                        k = torch.cat([k, pad_k], dim=2)
-                        v = torch.cat([v, pad_v], dim=2)
-                    keys.append(k)
-                    values.append(v)
+                        pad_shape = (1, k.size(1), pad_len, k.size(3))
+                        k = torch.cat([k, torch.zeros(pad_shape, device=device, dtype=k.dtype)], dim=2)
+                        v = torch.cat([v, torch.zeros(pad_shape, device=device, dtype=v.dtype)], dim=2)
+                    
+                    keys_to_cat.append(k)
+                    values_to_cat.append(v)
                 
-                # 拼接成 [Batch, num_heads, max_kv_len, head_dim]
-                batch_past_key_values.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
+                # --- 正确的填充方式 ---
+                # 将拼接好的 Batch Tensor 直接放入对象的列表中
+                # 这样 batched_past.get_seq_length(layer_idx) 就能返回 max_kv_len
+                batched_past.update(key_states=torch.cat(keys_to_cat, dim=0),
+                                    value_states=torch.cat(values_to_cat, dim=0),
+                                    layer_idx=layer_idx)
 
-            # 3. 准备正确的 Attention Mask [Batch, max_kv_len + 1] TODO: 把这部分代码再理解一下
+            # 3. 准备正确的 Attention Mask [Batch, max_kv_len + 1]
             # 注意：因为 input_ids 此时是 [Batch, 1]，
             # 传入模型的 mask 长度必须等于历史 KV 长度 + 1
             total_mask_len = max_kv_len + 1
@@ -204,7 +208,7 @@ async def scheduler():
                     input_ids=input_ids, 
                     attention_mask=attention_mask,
                     use_cache=True, 
-                    past_key_values=batch_past_key_values
+                    past_key_values=batched_past  # 传入 Batch 化的 KV Cache
                 )
                 
             new_past = outputs.past_key_values # 包含了更新后的 KV
@@ -221,8 +225,8 @@ async def scheduler():
                 # new_past 每层是 [Batch, head, seq_len+1, dim]
                 actual_new_len = current_kv_lens[i] + 1
                 req_new_kv = []
-                for layer_idx in range(num_layers):
-                    k_layer, v_layer = new_past[layer_idx]
+                for past_layer in new_past:
+                    k_layer, v_layer = past_layer[0], past_layer[1]  # k_layer, v_layer: (Batch, num_heads, seq_len+1, head_dim)
                     # 提取该请求对应的行，并只取有效长度的部分
                     k_i = k_layer[i:i+1, :, :actual_new_len, :].clone()
                     v_i = v_layer[i:i+1, :, :actual_new_len, :].clone()
@@ -265,3 +269,8 @@ async def generate(req: GenerateRequest):
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(scheduler())
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
