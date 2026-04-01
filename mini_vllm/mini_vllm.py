@@ -28,7 +28,7 @@ if torch.cuda.is_available():
             for d in hf_device_map.values()
             if isinstance(d, str) and d.startswith("cuda")
         ),
-        "cuda:0",
+        "cuda:1",
     )
 else:
     device = "cpu"
@@ -67,10 +67,6 @@ class Request:
 request_queue = asyncio.Queue()
 waiting_queue = []
 
-prefill_queue = []
-decode_queue = []
-
-
 
 # ======================
 # 4. Dynamic Batching Worker
@@ -80,10 +76,14 @@ TIMEOUT = 0.01  # 10ms
 
 
 async def scheduler():
-    global waiting_queue, prefill_queue, decode_queue
+    global waiting_queue
+
+    active_requests = []
 
     while True:
-        # Step 1: 收集新请求（dynamic batching）
+        # ======================
+        # Step 1: 收集新请求
+        # ======================
         try:
             while True:
                 req = request_queue.get_nowait()
@@ -91,154 +91,167 @@ async def scheduler():
         except asyncio.QueueEmpty:
             pass
 
-        # 构建prefill队列
-        while waiting_queue and len(prefill_queue) < BATCH_SIZE:
-            prefill_queue.append(waiting_queue.pop(0))
-        
-        if prefill_queue:
-            input_ids_list = [req.input_ids for req in prefill_queue]
+        # admission control
+        while waiting_queue and len(active_requests) < BATCH_SIZE:
+            active_requests.append(waiting_queue.pop(0))
+
+        if not active_requests:
+            await asyncio.sleep(0.001)
+            continue
+
+        # ======================
+        # Step 2: 拆分 PREFILL / DECODE
+        # ======================
+        prefill_reqs = [r for r in active_requests if r.stage == "PREFILL"]
+        decode_reqs  = [r for r in active_requests if r.stage == "DECODE"]
+
+        new_active = []
+
+        # ======================
+        # Step 3: PREFILL（单独 forward）
+        # ======================
+        if prefill_reqs:
+            input_ids_list = [r.input_ids for r in prefill_reqs]
             input_ids = torch.nn.utils.rnn.pad_sequence(
-                input_ids_list, batch_first=True, padding_value=tokenizer.pad_token_id or 0
-            )
-            attention_mask = (input_ids != (tokenizer.pad_token_id or 0)).long()
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+                input_ids_list,
+                batch_first=True,
+                padding_value=tokenizer.pad_token_id
+            ).to(device)
+
+            attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
             with torch.no_grad():
-                outputs = model(input_ids=input_ids, 
-                                attention_mask=attention_mask,
-                                use_cache=True)  # 预填充阶段启用 KV cache
-                
-                past = outputs.past_key_values  # 获取 KV cache, DynamicCache
-                logits = outputs.logits[:, -1, :]  # 只取最后一个 token 的 logits，供 decode 阶段使用
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=True
+                )
 
-                # 这里可以提取 KV cache，支持后续 decode 阶段
-                for i, req in enumerate(prefill_queue):
-                    actual_len = req.input_ids.size(0)  # 实际的序列长度
-                    req_kv_list = []
-                    
-                    # 遍历每一层（指模型的每一层 注意力 模块），提取对应请求的 KV
-                    for past_layer in past:
-                        # 提取第 i 个请求的 Key 和 Value
-                        k_layer, v_layer = past_layer[0], past_layer[1]  # k_layer, v_layer: (B, num_heads, seq_len, head_dim)
-                        k_i = k_layer[i:i+1, :, :actual_len, :].clone()  # 取第 i 个请求的 KV
-                        v_i = v_layer[i:i+1, :, :actual_len, :].clone()
-                        req_kv_list.append((k_i, v_i))
-                    
-                    # 将这个请求的专属 KV 存回 Request 对象
-                    req.KV_cache = req_kv_list
-                
-                next_tokens = torch.argmax(logits, dim=-1)
-            
-            new_decode_queue = []
-            for i, req in enumerate(prefill_queue):
+            past = outputs.past_key_values
+            logits = outputs.logits[:, -1, :]
+            next_tokens = torch.argmax(logits, dim=-1)
+
+            # 写回 KV + 更新状态
+            for i, req in enumerate(prefill_reqs):
                 req.step(next_tokens[i])
+                req.input_ids = torch.cat(
+                    [req.input_ids, next_tokens[i].view(1)], dim=0
+                )
 
-                req.stage = "DECODE"  # 切换到 decode 阶段
+                # 提取该 request 的 KV（无 padding）
+                actual_len = req.input_ids.size(0)
+
+                req_kv = []
+                for layer in past:
+                    k, v = layer[0], layer[1]
+                    k_i = k[i:i+1, :, :actual_len, :].clone()
+                    v_i = v[i:i+1, :, :actual_len, :].clone()
+                    req_kv.append((k_i, v_i))
+
+                req.KV_cache = req_kv
+                req.stage = "DECODE"
 
                 if not req.finished:
-                    # 更新输入（append token）
-                    req.input_ids = torch.cat([req.input_ids, next_tokens[i].view(1)], dim=0)
-                    new_decode_queue.append(req)
-            
-            decode_queue.extend(new_decode_queue)
-            prefill_queue = []  # 清空 prefill 队列
-
+                    new_active.append(req)
 
         # ======================
-        # 处理 decode 阶段的请求
+        # Step 4: DECODE（单独 forward）
         # ======================
-        if decode_queue:
-            # 1. 准备 input_ids [Batch, 1]
-            input_ids = torch.stack([req.input_ids[-1:] for req in decode_queue]).to(device)
+        if decode_reqs:
+            input_ids = torch.stack(
+                [r.input_ids[-1:] for r in decode_reqs]
+            ).to(device)  # [B,1]
 
-            # --- 准备 Batch 化的 KV Cache 和 Attention Mask ---
-
-            # 1. 创建空的 DynamicCache 对象
-            batched_past = DynamicCache()
-
-            # 2. 拼接每一层的 Batch KV
-            num_layers = len(decode_queue[0].KV_cache)
-            current_kv_lens = [req.KV_cache[0][0].size(2) for req in decode_queue]
+            # ===== 构建 batched KV =====
+            num_layers = len(decode_reqs[0].KV_cache)
+            current_kv_lens = [r.KV_cache[0][0].size(2) for r in decode_reqs]
             max_kv_len = max(current_kv_lens)
+
+            batched_past = DynamicCache()
 
             for layer_idx in range(num_layers):
                 keys_to_cat = []
                 values_to_cat = []
-                
-                for i, req in enumerate(decode_queue):
-                    k, v = req.KV_cache[layer_idx] # 每个 req 的 KV 是 [1, H, S, D]
-                    
-                    # 对齐长度（右填充）
+
+                for i, req in enumerate(decode_reqs):
+                    k, v = req.KV_cache[layer_idx]
+
                     pad_len = max_kv_len - k.size(2)
                     if pad_len > 0:
                         pad_shape = (1, k.size(1), pad_len, k.size(3))
-                        k = torch.cat([k, torch.zeros(pad_shape, device=device, dtype=k.dtype)], dim=2)
-                        v = torch.cat([v, torch.zeros(pad_shape, device=device, dtype=v.dtype)], dim=2)
-                    
+                        k = torch.cat([
+                            k,
+                            torch.zeros(pad_shape, device=device, dtype=k.dtype)
+                        ], dim=2)
+                        v = torch.cat([
+                            v,
+                            torch.zeros(pad_shape, device=device, dtype=v.dtype)
+                        ], dim=2)
+
                     keys_to_cat.append(k)
                     values_to_cat.append(v)
-                
-                # --- 正确的填充方式 ---
-                # 将拼接好的 Batch Tensor 直接放入对象的列表中
-                # 这样 batched_past.get_seq_length(layer_idx) 就能返回 max_kv_len
-                batched_past.update(key_states=torch.cat(keys_to_cat, dim=0),
-                                    value_states=torch.cat(values_to_cat, dim=0),
-                                    layer_idx=layer_idx)
 
-            # 3. 准备正确的 Attention Mask [Batch, max_kv_len + 1]
-            # 注意：因为 input_ids 此时是 [Batch, 1]，
-            # 传入模型的 mask 长度必须等于历史 KV 长度 + 1
-            total_mask_len = max_kv_len + 1
-            batch_masks = []
-            for i, req in enumerate(decode_queue):
-                # 有效位是 1，Padding 位是 0
-                # 这里的有效位 = 该请求的历史长度 + 当前这 1 个 token
+                batched_past.update(
+                    key_states=torch.cat(keys_to_cat, dim=0),
+                    value_states=torch.cat(values_to_cat, dim=0),
+                    layer_idx=layer_idx
+                )
+
+            # ===== 正确 attention mask =====
+            total_len = max_kv_len + 1
+            masks = []
+            for i in range(len(decode_reqs)):
                 valid_len = current_kv_lens[i] + 1
                 m = torch.cat([
                     torch.ones(valid_len, device=device),
-                    torch.zeros(total_mask_len - valid_len, device=device)
+                    torch.zeros(total_len - valid_len, device=device)
                 ])
-                batch_masks.append(m)
-            attention_mask = torch.stack(batch_masks).long()
+                masks.append(m)
 
-            # 4. Forward
+            attention_mask = torch.stack(masks).long()
+
+            # ===== forward =====
             with torch.no_grad():
                 outputs = model(
-                    input_ids=input_ids, 
+                    input_ids=input_ids,
                     attention_mask=attention_mask,
-                    use_cache=True, 
-                    past_key_values=batched_past  # 传入 Batch 化的 KV Cache
+                    use_cache=True,
+                    past_key_values=batched_past
                 )
-                
-            new_past = outputs.past_key_values # 包含了更新后的 KV
-            next_tokens = torch.argmax(outputs.logits[:, -1, :], dim=-1)
 
-            # 5. 更新状态并写回 KV Cache
-            for i, req in enumerate(decode_queue):
+            new_past = outputs.past_key_values
+            logits = outputs.logits[:, -1, :]
+            next_tokens = torch.argmax(logits, dim=-1)
+
+            # ===== 写回 KV =====
+            for i, req in enumerate(decode_reqs):
                 req.step(next_tokens[i])
-                
-                # 更新 input_ids
-                req.input_ids = torch.cat([req.input_ids, next_tokens[i].view(1)], dim=0)
+                req.input_ids = torch.cat(
+                    [req.input_ids, next_tokens[i].view(1)], dim=0
+                )
 
-                # 重要：从 new_past 中切分出属于该请求的 KV（去掉 Padding）
-                # new_past 每层是 [Batch, head, seq_len+1, dim]
-                actual_new_len = current_kv_lens[i] + 1
-                req_new_kv = []
-                for past_layer in new_past:
-                    k_layer, v_layer = past_layer[0], past_layer[1]  # k_layer, v_layer: (Batch, num_heads, seq_len+1, head_dim)
-                    # 提取该请求对应的行，并只取有效长度的部分
-                    k_i = k_layer[i:i+1, :, :actual_new_len, :].clone()
-                    v_i = v_layer[i:i+1, :, :actual_new_len, :].clone()
-                    req_new_kv.append((k_i, v_i))
-                req.KV_cache = req_new_kv
+                old_len = current_kv_lens[i]
+                new_len = old_len + 1
 
-            # 过滤完成的
-            decode_queue = [req for req in decode_queue if not req.finished]
+                req_kv = []
+                for layer in new_past:
+                    k, v = layer[0], layer[1]
+                    k_i = k[i:i+1, :, :new_len, :]
+                    v_i = v[i:i+1, :, :new_len, :]
+                    req_kv.append((k_i, v_i))
 
-            # Step 5: 避免空转
-        if not decode_queue and not prefill_queue:
-            await asyncio.sleep(0.001)  # 1ms
+                req.KV_cache = req_kv
+
+                if not req.finished:
+                    new_active.append(req)
+
+        # ======================
+        # Step 5: 更新 active
+        # ======================
+        active_requests = new_active
+
+        if not active_requests:
+            await asyncio.sleep(0.001)
 
 # ======================
 # 5. FastAPI 接口
