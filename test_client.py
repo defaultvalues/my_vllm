@@ -26,12 +26,10 @@ async def send_request(client, prompt, max_tokens):
 async def main():
     # 测试多个不同长度的并发请求
     prompts = [
-        "Explain what is a black hole in one sentence.",
-        "How to make a cup of coffee?",
-        "Write a 3-word poem.",
-        "What is the capital of France?",
         "[INST] Explain what is a black hole in one sentence. [/INST]",
-        "[INST] What is the capital of France? [/INST]"
+        "[INST] How to make a cup of coffee? [/INST]",
+        "[INST] Write a 3-word poem. [/INST]",
+        "[INST] What is the capital of France? [/INST]",
     ]
     
     async with httpx.AsyncClient() as client:
