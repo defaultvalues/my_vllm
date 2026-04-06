@@ -1,39 +1,16 @@
 import asyncio
 import torch
+import flashinfer
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb
+from transformers.models.mistral.modeling_mistral import MistralRotaryEmbedding as rotary_emb
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ======================
-# 1. 加载模型
-# ======================
-model_path = "/home/scm/mistral_models/7B-Instruct-v0.3"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-tokenizer.pad_token = tokenizer.eos_token
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    device_map=None  # 自动分配到双卡
-)
-
-model.eval()
-
-# 使用第一块可用 CUDA 设备作为输入放置设备，避免与 device_map="auto" 冲突
-if torch.cuda.is_available():
-    hf_device_map = getattr(model, "hf_device_map", {})
-    device = next(
-        (
-            d
-            for d in hf_device_map.values()
-            if isinstance(d, str) and d.startswith("cuda")
-        ),
-        "cuda:1",
-    )
-else:
-    device = "cpu"
-
-model.to(device)
+import types
+import uvicorn
 
 # ======================
 # 1. KVCache 管理
@@ -41,205 +18,271 @@ model.to(device)
 
 class KVCache:
     def __init__(self, num_blocks, num_layers, num_heads, head_dim, block_size, device, dtype):
+        """
+        K_cache 和 V_cache 的维度设计为 [num_layers, num_blocks, num_heads, block_size, head_dim]，方便按 block 存储和访问 KV
+        """
+
         self.num_blocks = num_blocks  # KV cache 的总块数，决定了最大并发请求数和最大序列长度, 一个block存的KV cache一定来自同一个请求
         self.block_size = block_size  # 每块的 token 数量，决定了每块能存储多少 KV
 
-        self.k_cache = torch.zeros(
-            num_blocks, num_layers, num_heads, block_size, head_dim,
-            device=device, dtype=dtype
+        self.kv_cache = torch.zeros(
+            (num_layers, num_blocks, 2, block_size, num_heads, head_dim),  # 注意这里多了一个维度来区分 K 和 V
+            dtype=dtype,
+            device=device
         )
-        self.v_cache = torch.zeros_like(self.k_cache)
-
-        self.block_fill = torch.zeros(num_blocks, dtype=torch.int32, device=device)  # 最大填充长度为 block_size
 
         self.free_blocks = list(range(num_blocks))  # 表示空闲块的索引列表
 
     def alloc_block(self):
         assert self.free_blocks, "KV cache OOM"
         idx = self.free_blocks.pop()
-        self.block_fill[idx] = 0
         return idx
 
     def free_block(self, idx):
         self.free_blocks.append(idx)
 
-
-def append_kv(req, new_k, new_v, kv_cache):
-    # new_k: [num_layers, num_heads, 1, head_dim]
-    """
-    req: Request 对象，包含 block_table 和 seq_len
-    new_k, new_v: 当前 step 生成的 KV, shape [num_layers, num_heads, 1, head_dim]
-    kv_cache: KVCache 对象，管理所有请求的 KV 存储和分配
-    """
-
-    if not req.block_table or \
-       kv_cache.block_fill[req.block_table[-1]] == kv_cache.block_size:  # 当前 block 已满，分配新块
-
-        new_block = kv_cache.alloc_block()  # 从 KVCache 获取一个新的 block 索引
-        req.block_table.append(new_block)  # 将新 block 加入 request 的 block_table
-
-    block_id = req.block_table[-1]  # 获取当前使用的 block 索引
-    pos = kv_cache.block_fill[block_id]  # 当前 block 已填充的 token 数量
-
-    kv_cache.k_cache[block_id, :, :, pos:pos+1, :] = new_k  # 写入新的 KV 到全局 KV cache 的正确位置， shape: [num_layers, num_heads, 1(seq_len), head_dim]
-    kv_cache.v_cache[block_id, :, :, pos:pos+1, :] = new_v
-
-    kv_cache.block_fill[block_id] += 1  # 更新当前 block 的填充长度
-    req.seq_len += 1  # 更新 request 的 KV cache 长度
-
-
-def build_past_from_blocks(requests, kv_cache, model): 
-    """
-    从 block-based KV 重建 HuggingFace 的 past_key_values (dense KV)
-
-    这是一个“过渡函数”：
-        - 现在为了兼容 HF 必须做 concat + padding
-        - 未来接 FlashInfer 会完全删除
-
-    输入:
-        requests: List[Request]
-        kv_cache: 全局 KV pool
-        model: 用于获取 num_layers
-
-    返回:
-        past: DynamicCache (HF 使用)
-        max_len: 当前 batch 的最大序列长度
-    """
-
-    num_layers = model.config.num_hidden_layers
-
-    # ===== Step 1: 找 batch 内最大长度（用于 padding）=====
-    max_len = max(r.seq_len for r in requests)  
+    def get_layer_cache(self, layer_idx):
+        """
+        返回某一层 KV cache
+        shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        """
+        return self.kv_cache[layer_idx]
     
 
-    # 用于存每一层的 KV（最后会拼成 batch）=====
-    batch_k = [[] for _ in range(num_layers)]
-    batch_v = [[] for _ in range(num_layers)]
-
-    # ===== Step 2: 遍历每个 request =====
-    for r in requests:
-
-        # 用于拼接该 request 的所有 KV
-        k_list = []
-        v_list = []
-
-        # ===== Step 2.1: 遍历 block_table =====
-        for bid in r.block_table:
-
-            fill = kv_cache.block_fill[bid] # 当前 block 已填充的 token 数量
-
-            # 从全局 KV pool 取出该 block 的有效部分
-            # shape: [num_layers, num_heads, fill, head_dim]
-            k_block = kv_cache.k_cache[bid, :, :, :fill, :]
-            v_block = kv_cache.v_cache[bid, :, :, :fill, :]
-
-            k_list.append(k_block)
-            v_list.append(v_block)
-
-        # ===== Step 2.2: 拼接所有 block（时间维）=====
-        # dim=2 是 token 维， 按sequence length拼接，得到 shape: [num_layers, num_heads, seq_len, head_dim]
+class InferenceMetadata:
+    """
+    统一管理KV cache相关的推理状态和元信息, 方便未来扩展更多功能(如分布式、FlashInfer 直接调用等)
+    """
+    def __init__(self):
+        self.is_decode = False
         
-        k_cat = torch.cat(k_list, dim=2)
-        v_cat = torch.cat(v_list, dim=2)
-
-        # ===== Step 2.3: padding（HF 必须）=====
-        pad_len = max_len - k_cat.size(2)
-
-        if pad_len > 0:
-            # padding tensor
-            pad_k = torch.zeros(
-                num_layers,
-                k_cat.size(1),   # num_heads
-                pad_len,
-                k_cat.size(3),   # head_dim
-                device=k_cat.device,
-                dtype=k_cat.dtype
-            )
-
-            pad_v = torch.zeros_like(pad_k)
-
-            k_cat = torch.cat([k_cat, pad_k], dim=2)
-            v_cat = torch.cat([v_cat, pad_v], dim=2)
-
-        # ===== Step 2.4: 按 layer 拆开 =====
-        for l in range(num_layers):
-            # 每个元素 shape:
-            # [1, num_heads, max_len, head_dim]，第一维度是 batch 维，后面会拼成 batch
-            batch_k[l].append(k_cat[l:l+1])
-            batch_v[l].append(v_cat[l:l+1])
-
-    # ===== Step 3: 构建 HF 的 past_key_values =====
-    past = DynamicCache()
-
-    for l in range(num_layers):
-        past.update(
-            key_states=torch.cat(batch_k[l], dim=0),   # [batch_size, num_heads, max_len, head_dim]
-            value_states=torch.cat(batch_v[l], dim=0),
-            layer_idx=l
+        # paged KV cache
+        self.paged_kv_indptr = None  # Tensor: [Batch + 1]，用来表示每个请求占用的block，在paged_kv_indices中的起止位置
+        self.paged_kv_indices = None  # Tensor: [Total_Blocks_In_Batch], 表示所有已经被占用的内存块在全局 KV cache 中的索引
+        self.paged_kv_last_page_len = None # Tensor: [Batch], 表示每个请求最后一个块实际使用的长度（因为可能不满 block_size），只有最后一个block可能不满，其他块都满
+        self.qo_indptr = None
+        
+        self.workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda:1")
+        
+        # ===== wrappers =====
+        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
         )
 
-    return past, max_len
+        self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self.workspace_buffer, "NHD"
+        )
 
-def write_prefill_kv_batch(requests, past_key_values, kv_cache):
-    """
-    支持 batch 的 prefill KV 写入
-    """
 
-    past = past_key_values
-    num_layers = len(past)
+# def flashinfer_attention_forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
+#     global global_kv_cache, inference_metadata
+#     bsz, q_len, _ = hidden_states.size()
 
-    for i, req in enumerate(requests):
+#     num_head = self.config.num_attention_heads
+#     head_dim = self.config.hidden_size // num_head
+#     num_kv_head = self.config.num_key_value_heads
+    
+#     # 1. 计算 QKV
+#     query_states = self.q_proj(hidden_states).view(bsz, q_len, num_head, head_dim)
+#     key_states = self.k_proj(hidden_states).view(bsz, q_len, num_kv_head, head_dim)
+#     value_states = self.v_proj(hidden_states).view(bsz, q_len, num_kv_head, head_dim)
 
-        # 每个 request 自己的有效长度
-        valid_len = len(req.input_ids) 
+#     # 2. RoPE (Mistral 默认 query_states, key_states 是 [B, S, H, D])
+#     cos, sin = position_embeddings
+#     # 注意：HF 的 apply_rotary_pos_emb 有时需要 transpose，根据具体版本调整
+#     # 这里假设输入是 [B, S, H, D]，需要匹配 flashinfer 的展平格式
+#     query_states, key_states = apply_rotary_pos_emb(
+#         query_states.transpose(1, 2), key_states.transpose(1, 2), cos, sin
+#     )
+#     # 转回 [B, S, H, D] 并展平为 [Total_Tokens, H, D]
+#     query_states = query_states.transpose(1, 2).reshape(-1, num_head, head_dim)
+#     key_states = key_states.transpose(1, 2).reshape(-1, num_kv_head, head_dim)
+#     value_states = value_states.transpose(1, 2).reshape(-1, num_kv_head, head_dim)
 
-        for t in range(valid_len):
+#     # 构造 mask（来自 metadata）
+#     mask = inference_metadata.token_mask  # [B*S]
 
-            k_list = []
-            v_list = []
+#     query_states = query_states.reshape(-1, num_head, head_dim)[mask]
+#     key_states = key_states.reshape(-1, num_kv_head, head_dim)[mask]
+#     value_states = value_states.reshape(-1, num_kv_head, head_dim)[mask]
 
-            for past_layer in past:
-                k, v = past_layer[0], past_layer[1]  # shape: [batch_size, num_heads, seq_len, head_dim]
+#     # 3. 将新的 KV 写入 Paged Cache
+#     # FlashInfer 提供了高效的 append 算子
+#     flashinfer.append_paged_kv_cache(
+#         key_states,
+#         value_states,
+#         inference_metadata.batch_indices,     
+#         inference_metadata.positions,         
+#         global_kv_cache.kv_cache[self.layer_idx],  
+#         inference_metadata.paged_kv_indices,
+#         inference_metadata.paged_kv_indptr,
+#         inference_metadata.paged_kv_last_page_len,
+#         kv_layout="NHD"
+#     )
 
-                k_t = k[i, :, t:t+1, :]  # shape: [num_heads, 1, head_dim]
-                v_t = v[i, :, t:t+1, :]
+#     # 4. 计算 Attention
+#     if not inference_metadata.is_decode:
+#         # Prefill 模式
+#         out = inference_metadata.prefill_wrapper.run(
+#             query_states, 
+#             global_kv_cache.kv_cache[self.layer_idx],
+#         )
+#     else:
+#         # Decode 模式
+#         out = inference_metadata.decode_wrapper.run(
+#             query_states,
+#             global_kv_cache.kv_cache[self.layer_idx]
+#         )
+    
+#     return self.o_proj(out.view(bsz, q_len, -1)), None, None
 
-                k_list.append(k_t.unsqueeze(0))
-                v_list.append(v_t.unsqueeze(0))
+def flashinfer_attention_forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
+    global global_kv_cache, inference_metadata
+    bsz, q_len, _ = hidden_states.size()
+    device = hidden_states.device # 确保设备一致
 
-            new_k = torch.cat(k_list, dim=0)  # shape: [num_layers, num_heads, 1, head_dim]
-            new_v = torch.cat(v_list, dim=0)
+    num_head = self.config.num_attention_heads
+    head_dim = self.config.hidden_size // num_head
+    num_kv_head = self.config.num_key_value_heads
+    
+    # 1. 计算 QKV
+    query_states = self.q_proj(hidden_states).view(bsz, q_len, num_head, head_dim)
+    key_states = self.k_proj(hidden_states).view(bsz, q_len, num_kv_head, head_dim)
+    value_states = self.v_proj(hidden_states).view(bsz, q_len, num_kv_head, head_dim)
 
-            append_kv(req, new_k, new_v, kv_cache)  # 逐token写入 KV cache
+    # 2. RoPE
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states.transpose(1, 2), key_states.transpose(1, 2), cos, sin
+    )
+    
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
 
-def extract_new_kv(requests, past_key_values, kv_cache):
-    """
-    对于decoding阶段的请求, 从 HF 的 past_key_values 中提取当前 step 生成的 KV, 并写入全局 KV cache
-     - requests: 当前 batch 的请求列表
-     - past_key_values: HF 模型输出的 past_key_values, 包含当前 step 生成的 KV
-     - kv_cache: 全局 KVCache 对象，用于存储所有请求的 KV
-    """
+    # 获取 mask（来自 prepare_metadata）
+    mask = inference_metadata.token_mask  # [B * S] 这里的 S 是当前 batch 的最大 q_len
+    
+    # 如果 mask 长度由于 pad_sequence 导致和当前 hidden_states 不符，需要动态截断或对齐
+    # 在 scheduler 里 pad 后的总长度是 bsz * q_len
+    current_mask = mask[:bsz * q_len] 
 
-    past = past_key_values
+    # 提取有效 Token
+    q_valid = query_states.reshape(-1, num_head, head_dim)[current_mask]
+    k_valid = key_states.reshape(-1, num_kv_head, head_dim)[current_mask]
+    v_valid = value_states.reshape(-1, num_kv_head, head_dim)[current_mask]
 
-    for i, req in enumerate(requests):
+    # 3. 将新的 KV 写入 Paged Cache
+    flashinfer.append_paged_kv_cache(
+        k_valid,
+        v_valid,
+        inference_metadata.batch_indices,     
+        inference_metadata.positions,         
+        global_kv_cache.kv_cache[self.layer_idx],  
+        inference_metadata.paged_kv_indices,
+        inference_metadata.paged_kv_indptr,
+        inference_metadata.paged_kv_last_page_len,
+        kv_layout="NHD"
+    )
+
+    # 4. 计算 Attention
+    if not inference_metadata.is_decode:
+        out_valid = inference_metadata.prefill_wrapper.run(
+            q_valid, 
+            global_kv_cache.kv_cache[self.layer_idx],
+        )
+    else:
+        out_valid = inference_metadata.decode_wrapper.run(
+            q_valid,
+            global_kv_cache.kv_cache[self.layer_idx]
+        )
+    
+    # === 关键修复：将结果填充回原始形状 ===
+    # 创建一个全 0 张量，形状为 [B*S, Hidden_Size]
+    full_out = torch.zeros(bsz * q_len, self.config.hidden_size, dtype=out_valid.dtype, device=device)
+    # 将有效计算结果填入对应的位置
+    full_out[current_mask] = out_valid.view(-1, self.config.hidden_size)
+    
+    # 恢复形状为 [B, S, Hidden_Size]
+    return self.o_proj(full_out.view(bsz, q_len, -1)), None
+
+def prepare_metadata(requests, kv_cache, metadata, is_decode):
+    device = kv_cache.kv_cache.device
+    metadata.is_decode = is_decode
+    
+    # 构建 FlashInfer 需要的各种索引 Tensor
+    page_indices = []
+    page_indptr = [0]
+    last_page_len = []
+    
+    # 用于 append_paged_kv_cache 的 token 级别偏移
+    append_indptr = [0] 
+    
+    # 用于 prefill query 的 token 级别偏移
+    qo_indptr = [0]
+
+    # ===== 构造 token mask（去掉 padding）=====
+    token_mask = []
         
-        k_list = []
-        v_list = []
 
-        for past_layer in past:
-            k, v = past_layer[0], past_layer[1]  # shape: [batch_size, num_heads, seq_len, head_dim]
+    # pad 补齐
+    for req in requests:
+        page_indices.extend(req.block_table)
+        page_indptr.append(page_indptr[-1] + len(req.block_table))
+        
+        # 关键：计算 append 之前的起始位置
+        # 注意：在 forward 执行 append 之前，KV cache 里的长度
+        cur_seq_len = req.seq_len - (1 if is_decode else len(req.input_ids))
+        last_page_len.append((cur_seq_len - 1) % kv_cache.block_size + 1)
+        
+        append_indptr.append(append_indptr[-1] + (1 if is_decode else len(req.input_ids)))
+        qo_indptr.append(qo_indptr[-1] + (1 if is_decode else len(req.input_ids)))
 
-            k_i = k[i:i+1, :, -1:, :]  # 取当前 step 生成的 KV，shape: [1, num_heads, 1, head_dim]
-            v_i = v[i:i+1, :, -1:, :]
+        valid = (1 if is_decode else len(req.input_ids))
+        token_mask.extend([1] * valid)
 
-            k_list.append(k_i)
-            v_list.append(v_i)
+    metadata.paged_kv_indices = torch.tensor(page_indices, dtype=torch.int32, device=device)
+    metadata.paged_kv_indptr = torch.tensor(page_indptr, dtype=torch.int32, device=device)
+    metadata.paged_kv_last_page_len = torch.tensor(last_page_len, dtype=torch.int32, device=device)
+    metadata.append_indptr = torch.tensor(append_indptr, dtype=torch.int32, device=device)
+    metadata.qo_indptr = torch.tensor(qo_indptr, dtype=torch.int32, device=device)
+    
+    total_tokens = metadata.append_indptr[-1].item()
+    max_tokens = len(requests) * max(
+        [1 if is_decode else len(r.input_ids) for r in requests]
+    )
 
-        new_k = torch.cat(k_list, dim=0)  # shape: [num_layers, num_heads, 1, head_dim]
-        new_v = torch.cat(v_list, dim=0)
+    token_mask.extend([0] * (max_tokens - total_tokens))
 
-        append_kv(req, new_k, new_v, kv_cache)  # 写入全局 KV cache
+    metadata.token_mask = torch.tensor(token_mask, dtype=torch.bool, device=device)
+
+    if is_decode:
+        metadata.decode_wrapper.plan(
+            metadata.paged_kv_indptr, metadata.paged_kv_indices, metadata.paged_kv_last_page_len,
+            model.config.num_attention_heads, model.config.num_key_value_heads,
+            model.config.hidden_size // model.config.num_attention_heads,
+            kv_cache.block_size, pos_encoding_mode="NONE", q_data_type=torch.float16
+        )
+    else:
+        metadata.prefill_wrapper.plan(
+            metadata.qo_indptr, metadata.paged_kv_indptr, metadata.paged_kv_indices,
+            metadata.paged_kv_last_page_len, model.config.num_attention_heads,
+            model.config.num_key_value_heads, model.config.hidden_size // model.config.num_attention_heads,
+            kv_cache.block_size
+        )
+    
+    seq_lens = flashinfer.get_seq_lens(
+        metadata.paged_kv_indptr,
+        metadata.paged_kv_last_page_len,
+        kv_cache.block_size
+    )
+
+    print("Seq lens:", seq_lens)
+
+    metadata.batch_indices, metadata.positions = flashinfer.get_batch_indices_positions(
+        metadata.append_indptr,
+        seq_lens,
+        metadata.append_indptr[-1].item()
+    )
 
 # ======================
 # 2. Request 定义
@@ -275,6 +318,8 @@ class Request:
 request_queue = asyncio.Queue()
 waiting_queue = []
 
+global_kv_cache = None  # 全局 KV cache 对象，供 scheduler 和 attention forward 访问
+inference_metadata = InferenceMetadata()  # 管理 KV cache 相关的推理状态和元信息
 
 # ======================
 # 4. Dynamic Batching Worker
@@ -284,16 +329,16 @@ TIMEOUT = 0.01  # 10ms
 
 
 async def scheduler():
-    global waiting_queue, kv_cache
+    global waiting_queue, global_kv_cache, inference_metadata
 
     active_requests = []
 
-    kv_cache = KVCache(
+    global_kv_cache = KVCache(
         num_blocks=16,  # 假设最多支持16个并发请求（每个请求最多使用一个 block，实际可以更灵活）
         num_layers=model.config.num_hidden_layers,
         num_heads=model.config.num_key_value_heads,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
-        block_size=32,  # 每块最多存32个 token 的 KV，实际使用中可以根据请求长度动态调整
+        block_size=16,  # 每块最多存32个 token 的 KV，实际使用中可以根据请求长度动态调整
         device=device,
         dtype=model.dtype
     )
@@ -304,9 +349,9 @@ async def scheduler():
         # ======================
         try:
             while True:
-                req = request_queue.get_nowait()
+                req = await asyncio.wait_for(request_queue.get(), timeout=0.001)
                 waiting_queue.append(req)
-        except asyncio.QueueEmpty:
+        except asyncio.TimeoutError:
             pass
 
         # admission control
@@ -336,21 +381,31 @@ async def scheduler():
                 padding_value=tokenizer.pad_token_id
             ).to(device)
 
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+
+            # 提前分配好 KV cache 的 block，并准备好 metadata 供 attention forward 使用
+            for req in prefill_reqs:
+                num_tokens = len(req.input_ids)
+                
+                num_blocks_needed = (num_tokens + global_kv_cache.block_size - 1) // global_kv_cache.block_size
+                for _ in range(num_blocks_needed):
+                    new_block_id = global_kv_cache.alloc_block()
+                    req.block_table.append(new_block_id)
+
+                req.seq_len = num_tokens  # 更新 seq_len，表示已经填充了这么多 KV，只是声明占用，实际写入会在 attention forward 中完成
+            
+            # 设置metadata，管理 KV cache 的索引和状态，供 attention forward 使用
+            prepare_metadata(prefill_reqs, global_kv_cache, inference_metadata, is_decode=False)
 
             with torch.no_grad():
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=True
-                )
+                outputs = model(input_ids=input_ids, use_cache=True)
 
             logits = outputs.logits[:, -1, :]
             next_tokens = torch.argmax(logits, dim=-1)
 
-            write_prefill_kv_batch(prefill_reqs, outputs.past_key_values, kv_cache)
+            # TODO: 更新 kv cache block的填充状态（注意：Prefill阶段我们假设一次性把整个输入的 KV 都写入了，所以直接根据输入长度计算填充状态）
 
-            # 写回 KV + 更新状态
+
+
             for i, req in enumerate(prefill_reqs):
                 req.step(next_tokens[i])
                 req.input_ids = torch.cat(
@@ -361,50 +416,42 @@ async def scheduler():
 
                 if not req.finished:
                     new_active.append(req)
+                else:
+                    # 释放 KV block
+                    for block_id in req.block_table:
+                        global_kv_cache.free_block(block_id)
+                    req.block_table = []  # 清空 block_table，表示不再占用 KV cache
 
         # ======================
         # Step 4: DECODE（单独 forward）
         # ======================
         if decode_reqs:
-            input_ids = torch.stack(
-                [r.input_ids[-1:] for r in decode_reqs]
-            ).to(device)  # [B,1]
+            input_ids = torch.stack([r.input_ids[-1:] for r in decode_reqs]).to(device)  # [B,1]
 
-            # ===== 构建 batched KV =====
+            # ======================
+            # 1. 显存管理：为即将生成的 Token 分配 Block
+            # ======================
+            for req in decode_reqs:
+                # 
+                if req.seq_len % global_kv_cache.block_size == 0:  # 每当生成的 token 数达到 block_size 的倍数时，分配一个新块
+                    new_block_id = global_kv_cache.alloc_block()
+                    req.block_table.append(new_block_id)
+                
+                # 更新逻辑长度（注意：这是在模型 forward 之前更新，因为我们要写进去）
+                req.seq_len += 1 
             
-            current_kv_lens = [r.seq_len for r in decode_reqs]
-            
-            batched_past, max_kv_len = build_past_from_blocks(decode_reqs, kv_cache, model)  # 构建 HF 的 past_key_values，返回当前 batch 的最大 KV 长度（用于构建 attention mask）
+            prepare_metadata(decode_reqs, global_kv_cache, inference_metadata, is_decode=True)
 
 
-            # ===== 正确 attention mask =====
-            total_len = max_kv_len + 1
-            masks = []
-            for i in range(len(decode_reqs)):
-                valid_len = current_kv_lens[i] + 1
-                m = torch.cat([
-                    torch.ones(valid_len, device=device),
-                    torch.zeros(total_len - valid_len, device=device)
-                ])
-                masks.append(m)
-
-            attention_mask = torch.stack(masks).long()
-
-            # ===== forward =====
             with torch.no_grad():
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=True,
-                    past_key_values=batched_past
-                )
-
-            extract_new_kv(decode_reqs, outputs.past_key_values, kv_cache)
-            
+                # 进入模型，此时内部的 Attention 已经被 Patch 成了 FlashInfer.run()
+                # 它会自动完成：写入新 KV -> 计算 PagedAttention -> 输出
+                outputs = model(input_ids=input_ids)
+                    
             logits = outputs.logits[:, -1, :]
             next_tokens = torch.argmax(logits, dim=-1)
 
-            # ===== 写回 KV =====
+            # 更新request状态，准备下一步输入
             for i, req in enumerate(decode_reqs):
                 req.step(next_tokens[i])
                 req.input_ids = torch.cat(
@@ -413,6 +460,11 @@ async def scheduler():
 
                 if not req.finished:
                     new_active.append(req)
+                else:
+                    # 释放 KV block
+                    for block_id in req.block_table:
+                        global_kv_cache.free_block(block_id)
+                    req.block_table = []  # 清空 block_table，表示不再占用 KV cache
 
         # ======================
         # Step 5: 更新 active
@@ -454,5 +506,29 @@ async def startup_event():
 
 
 if __name__ == "__main__":
-    import uvicorn
+    
+    # ======================
+    # 1. 加载模型
+    # ======================
+    model_path = "/home/scm/mistral_models/7B-Instruct-v0.3"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map=None  # 自动分配到双卡
+    )
+
+    model.eval()
+
+    device = "cuda:1"
+
+    model.to(device)
+
+    # 替换HF模型中每层的 self_attn.forward 为 flashinfer_attention_forward
+    for i, layer in enumerate(model.model.layers):  
+        layer.self_attn.layer_idx = i  # 给每层 attention 绑定一个 layer_idx 属性，方便在 forward 中访问对应的 KV cache block
+        layer.self_attn.forward = types.MethodType(flashinfer_attention_forward, layer.self_attn)
+
     uvicorn.run(app, host="0.0.0.0", port=8001)
