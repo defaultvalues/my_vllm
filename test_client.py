@@ -26,16 +26,16 @@ async def send_request(client, prompt, max_tokens):
 async def main():
     # 测试多个不同长度的并发请求
     prompts = [
-        "[INST] Explain what is a black hole in one sentence. [/INST]",
+        "Explain what is a black hole in one sentence. ",
         "[INST] How to make a cup of coffee? [/INST]",
-        "[INST] Write a 3-word poem. [/INST]",
-        "[INST] What is the capital of France? [/INST]",
+        "[INST] Please write a 3-word poem. [/INST]",
+        "[INST] What is the capital of China? [/INST]",
     ]
     
     async with httpx.AsyncClient() as client:
         print(f"Sending {len(prompts)} concurrent requests to Mini-vLLM...")
         # 同时发送所有请求
-        tasks = [send_request(client, p, 20) for p in prompts]
+        tasks = [send_request(client, p, 32) for p in prompts]
         await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
