@@ -35,7 +35,7 @@ async def main():
     async with httpx.AsyncClient() as client:
         print(f"Sending {len(prompts)} concurrent requests to Mini-vLLM...")
         # 同时发送所有请求
-        tasks = [send_request(client, p, 64) for p in prompts]
+        tasks = [send_request(client, p, 128) for p in prompts]
         await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
