@@ -1,7 +1,6 @@
 """
-这一版本希望实现真正的continous batching。
+HF Baseline 实现，使用 Hugging Face 的 AutoModelForCausalLM 加载 Mistral 模型，并通过 FastAPI 提供一个简单的文本生成接口。核心部分是实现了一个基于 KV cache 的动态 batching 机制，支持 Prefill + Decode 分阶段处理，同时在 attention forward 中集成了 FlashInfer 的 Paged KV Cache 功能，实现高效的 KV 管理和计算。
 """
-
 import asyncio
 import torch
 import flashinfer
@@ -135,7 +134,7 @@ def flashinfer_attention_forward(self, hidden_states, position_embeddings, atten
         kv_layout="NHD"
     )
 
-    # assert q_valid.shape[0] == inference_metadata.append_indptr[-1]
+    assert q_valid.shape[0] == inference_metadata.append_indptr[-1]
     assert len(inference_metadata.batch_indices) == q_valid.shape[0]
     assert len(inference_metadata.positions) == q_valid.shape[0]
 
@@ -230,6 +229,7 @@ class Request:
         self.generated = []
         self.max_new_tokens = max_new_tokens
         self.finished = False
+        self.past_key_values = None  # 存储该请求的 KV cache 索引和内容，支持 Prefill + Decode
 
         self.stage = "PREFILL"  # or DECODE, 实现Prefill + Decode分阶段处理
 
@@ -265,26 +265,15 @@ BATCH_SIZE = 4
 TIMEOUT = 0.01  # 10ms
 # CHUNCK_SIZE = 16  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
 
-
-async def scheduler():
-    global waiting_queue, global_kv_cache, inference_metadata
+# TODO: 修改写kv cache的方式
+async def scheduler_hf():
+    global waiting_queue
 
     active_requests = []
 
-    global_kv_cache = KVCache(
-        num_blocks=32,  # 假设最多支持16个并发请求（每个请求最多使用一个 block，实际可以更灵活）
-        num_layers=model.config.num_hidden_layers,
-        num_heads=model.config.num_key_value_heads,
-        head_dim=model.config.hidden_size // model.config.num_attention_heads,
-        block_size=16,  # 每块最多存32个 token 的 KV，实际使用中可以根据请求长度动态调整
-        device=device,
-        dtype=model.dtype
-    )
-
     while True:
         # ======================
-        # Step 1: 收集新请求
-        # TODO: Admission Control
+        # Step 1: 收集请求
         # ======================
         try:
             while True:
@@ -293,7 +282,6 @@ async def scheduler():
         except asyncio.TimeoutError:
             pass
 
-        # admission control
         while waiting_queue and len(active_requests) < BATCH_SIZE:
             active_requests.append(waiting_queue.pop(0))
 
@@ -301,90 +289,116 @@ async def scheduler():
             await asyncio.sleep(0.001)
             continue
 
-
         # ======================
-        # Step 2: 准备模型的输入（调度哪些请求在这次进行推理）
-        # 对于prefill阶段的任务，考虑它放多少进来prefill
+        # Step 2: 拆分阶段（关键）
         # ======================
-    
-        input_ids_list = []
-        position_ids_list = []
+        prefill_reqs = []
+        decode_reqs = []
 
         for req in active_requests:
             if req.stage == "PREFILL":
-                input_ids_list.append(req.input_ids)
-                position_ids_list.append(torch.arange(len(req.input_ids), dtype=torch.long, device=device))
-                # TODO: 这里可以后续调整为chunk prefill
-                num_new_tokens = len(req.input_ids) - req.cursor
-                # print(num_new_tokens)
-
-                # 根据新的输入长度，计算需要分配多少 KV block，并更新请求的 block table
-                num_blocks_needed = (num_new_tokens + global_kv_cache.block_size - 1) // global_kv_cache.block_size
-                for _ in range(num_blocks_needed):
-                    new_block_id = global_kv_cache.alloc_block()
-                    req.block_table.append(new_block_id)
-
+                prefill_reqs.append(req)
             else:
-                input_ids_list.append(req.input_ids[-1:])  # decode阶段每次只送入最后一个 token
-                position_ids_list.append(torch.tensor([len(req.input_ids) - 1], dtype=torch.long, device=device))
-                num_new_tokens = 1  # decode阶段每次只生成一个 token
-
-                # 如果现在的block table已经满了，说明之前分配的 KV block 已经用完了，需要再分配一个新的 block 来存储新的 KV
-                if req.seq_len % global_kv_cache.block_size == 0:
-                    new_block_id = global_kv_cache.alloc_block()
-                    req.block_table.append(new_block_id)
-            
-            
-            req.seq_len += num_new_tokens  # 更新 seq_len，表示已经填充了这么多 KV，只是声明占用，实际写入会在 attention forward 中完成
-        
-        input_ids = torch.cat(input_ids_list).to(device)
-        position_ids = torch.cat(position_ids_list).to(device)
-        
-        # 设置metadata，管理 KV cache 的索引和状态，供 attention forward 使用
-        prepare_metadata(active_requests, global_kv_cache, inference_metadata)
-
-        with torch.no_grad():
-            outputs = model(input_ids=input_ids.unsqueeze(0), 
-                            position_ids=position_ids.unsqueeze(0),
-                            use_cache=False)
-
-        all_logits = outputs.logits.squeeze(0)
-
+                decode_reqs.append(req)
 
         # ======================
-        # Step 3: 从模型输出中取出每个请求对应的 logits，并采样得到下一个 token
+        # Step 3: PREFILL batch
         # ======================
-        new_active = []
+        if prefill_reqs:
+            input_ids_list = [req.input_ids for req in prefill_reqs]
+            max_len = max(x.size(0) for x in input_ids_list)
 
-        for i, req in enumerate(active_requests):
-            last_token_idx = inference_metadata.qo_indptr[i + 1] - 1  # 每个请求最后一个 token 的位置
-            logits = all_logits[last_token_idx]  # 取出对应位置的 logits
-            next_token = torch.argmax(logits, dim=-1)  # 简单 greedy 采样，后续可以替换为更复杂的采样策略
-            req.step(next_token)
+            padded_inputs = []
+            attention_masks = []
 
-            req.input_ids = torch.cat(
-                [req.input_ids, next_token.view(1)], dim=0
-            )
-            
-            req.stage = "DECODE"
+            for tokens in input_ids_list:
+                pad_len = max_len - tokens.size(0)
 
-            if not req.finished:
-                new_active.append(req)
-            else:
-                # 释放 KV block
-                for block_id in req.block_table:
-                    global_kv_cache.free_block(block_id)
-                req.block_table = []  # 清空 block_table，表示不再占用 KV cache
+                padded = torch.cat([
+                    tokens,
+                    torch.full((pad_len,), tokenizer.pad_token_id, device=device)
+                ])
 
-       
+                mask = torch.cat([
+                    torch.ones(tokens.size(0), device=device),
+                    torch.zeros(pad_len, device=device)
+                ])
+
+                padded_inputs.append(padded)
+                attention_masks.append(mask)
+
+            input_ids = torch.stack(padded_inputs)
+            attention_mask = torch.stack(attention_masks)
+
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=True
+                )
+
+            logits = outputs.logits
+            pkv = outputs.past_key_values
+
+            for i, req in enumerate(prefill_reqs):
+                last_idx = attention_mask[i].sum().long() - 1
+                next_token = torch.argmax(logits[i, last_idx], dim=-1)
+
+                req.past_key_values = [
+                    (k[i:i+1], v[i:i+1]) for (k, v) in pkv
+                ]
+
+                req.step(next_token)
+
+                req.input_ids = torch.cat(
+                    [req.input_ids, next_token.view(1)], dim=0
+                )
+
+                req.stage = "DECODE"
+
         # ======================
-        # Step 5: 更新 active
+        # Step 4: DECODE batch
         # ======================
-        active_requests = new_active
+        if decode_reqs:
+            input_ids = torch.stack([
+                req.input_ids[-1:] for req in decode_reqs
+            ])  # [B, 1]
 
-        # if not active_requests:
-        #     await asyncio.sleep(0.001)
+            past_key_values = [
+                (
+                    torch.cat([req.past_key_values[l][0] for req in decode_reqs], dim=0),
+                    torch.cat([req.past_key_values[l][1] for req in decode_reqs], dim=0)
+                )
+                for l in range(len(decode_reqs[0].past_key_values))
+            ]
 
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+
+            logits = outputs.logits
+            new_pkv = outputs.past_key_values
+
+            for i, req in enumerate(decode_reqs):
+                next_token = torch.argmax(logits[i, -1], dim=-1)
+
+                req.past_key_values = [
+                    (k[i:i+1], v[i:i+1]) for (k, v) in new_pkv
+                ]
+
+                req.step(next_token)
+
+                req.input_ids = torch.cat(
+                    [req.input_ids, next_token.view(1)], dim=0
+                )
+
+        # ======================
+        # Step 5: 清理 finished
+        # ======================
+        active_requests = [req for req in active_requests if not req.finished]
 # ======================
 # 5. FastAPI 接口
 # ======================
@@ -413,7 +427,7 @@ async def generate(req: GenerateRequest):
 # ======================
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(scheduler())
+    asyncio.create_task(scheduler_hf())
 
 
 if __name__ == "__main__":
@@ -438,8 +452,8 @@ if __name__ == "__main__":
     model.to(device)
 
     # 替换HF模型中每层的 self_attn.forward 为 flashinfer_attention_forward
-    for i, layer in enumerate(model.model.layers):  
-        layer.self_attn.layer_idx = i  # 给每层 attention 绑定一个 layer_idx 属性，方便在 forward 中访问对应的 KV cache block
-        layer.self_attn.forward = types.MethodType(flashinfer_attention_forward, layer.self_attn)
+    # for i, layer in enumerate(model.model.layers):  
+    #     layer.self_attn.layer_idx = i  # 给每层 attention 绑定一个 layer_idx 属性，方便在 forward 中访问对应的 KV cache block
+    #     layer.self_attn.forward = types.MethodType(flashinfer_attention_forward, layer.self_attn)
 
     uvicorn.run(app, host="0.0.0.0", port=8001)

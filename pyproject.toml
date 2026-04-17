@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.13.0",
+    "aiohttp",
     "bitsandbytes>=0.49.2",
     "fastapi>=0.135.2",
     "flashinfer-python>=0.2.5",

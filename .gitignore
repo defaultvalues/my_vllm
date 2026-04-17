@@ -9,3 +9,4 @@ wheels/
 # Virtual environments
 .venv
 7B-Instruct-v0.3/
+mistral-100M/
