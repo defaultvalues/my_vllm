@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import math
 import torch
 import flashinfer
 
@@ -33,17 +34,27 @@ class KVCache:
         )
 
         self.free_blocks = list(range(num_blocks))  # 表示空闲块的索引列表
+        self.reserved_blocks = 0
 
     def alloc_block(self):
         assert self.free_blocks, "KV cache OOM"
         idx = self.free_blocks.pop()
+        if self.reserved_blocks > 0:
+            self.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块，确保available_blocks的计算正确反映剩余的可用块数量
         return idx
+    
+    def reserve(self, num):
+        self.reserved_blocks += num
+
+    def release_reserved(self, num):
+        self.reserved_blocks -= num
+        assert self.reserved_blocks >= 0, "Reserved blocks cannot be negative"
 
     def free_block(self, idx):
         self.free_blocks.append(idx)
     
-    def get_num_free_blocks(self):
-        return len(self.free_blocks)
+    def available_blocks(self):
+        return len(self.free_blocks) - self.reserved_blocks
 
     def get_layer_cache(self, layer_idx):
         """
@@ -233,10 +244,13 @@ class Request:
         self.stage = "PREFILL"  # or DECODE, 实现Prefill + Decode分阶段处理
 
         # [((1, num_heads, seq_len, head_dim), (1, num_heads, seq_len, head_dim)), ...] 每层的 KV cache
-
+        total_required_blocks = math.ceil((len(self.input_ids) + max_new_tokens) / 32)  # 根据输入长度预估需要的 KV block 数量，实际分配在 scheduler 中根据 token budget 和 block budget 决定
+        self.reserved_blocks = total_required_blocks  # 预占 KV block，确保调度时有足够的资源，实际分配在 scheduler 中根据 token budget 和 block budget 决定
+        
         self.block_table = []  # List(int), 存储该请求使用的 block 索引，支持 Prefill + Decode
         self.seq_len = 0  # 当前已生成的总长度（输入 + 输出）
 
+        # 控制chunk prefill
         self.cursor = 0  # 当前 prefill 进度
         self.num_tokens_this_step = 0  # 本次 step 生成的 token 数量，prefill阶段可能一次生成多个 token，decode阶段通常是1
 
@@ -293,8 +307,22 @@ async def scheduler():
                 waiting_queue.append(req)
         except asyncio.TimeoutError:
             pass
-
+        
         # Admission control
+        while waiting_queue:
+            req = waiting_queue[0]
+
+            if global_kv_cache.available_blocks() >= req.reserved_blocks:
+                active_requests.append(waiting_queue.pop(0))
+                global_kv_cache.reserve(req.reserved_blocks)  # 预占 KV block，确保后续调度和分配时有足够的资源
+
+                # 这里虽然预留了，但是我们不知道这个请求实际会占用多少block，因为可能会提前停止
+                # 所以不能在free block 的时候对reserved block进行调整，那样只是减少了实际占用的block的数量，但正确的是释放这个请求真正预留的block数量
+
+            else:
+                break  # 当前剩余的 KV block 不足以满足下一个请求，先处理当前的 active_requests，等下一轮再尝试调度新的请求
+
+        
         # 调度器发挥作用的地方，判断哪些请求应该在这一次被执行
         current_batch = []
         token_budget = MAX_TOKENS_PER_STEP
@@ -305,7 +333,7 @@ async def scheduler():
             if req.stage == "DECODE":
                 # 检查显存够不够
                 if req.seq_len % global_kv_cache.block_size == 0:
-                    if global_kv_cache.get_num_free_blocks() > 0:
+                    if global_kv_cache.available_blocks() > 0:
                         token_budget -= 1  # decode阶段每个请求每轮只生成一个 token
                         req.num_tokens_this_step = 1
                         current_batch.append(req)
@@ -320,7 +348,7 @@ async def scheduler():
         
         for req in active_requests:
             if req.stage == "PREFILL" and token_budget > 0:
-                free_blocks = global_kv_cache.get_num_free_blocks()
+                free_blocks = global_kv_cache.available_blocks()
                 if free_blocks == 0:
                     continue # 这一轮先不给 prefill 分预算了，保住 decode 的预算，等下一轮再分配预算给 prefill
                 
@@ -339,9 +367,6 @@ async def scheduler():
                 token_budget -= cur_chunk
                 current_batch.append(req)
 
-
-        while waiting_queue and len(current_batch) < MAX_REQ_PER_STEP and token_budget > 0:
-            active_requests.append(waiting_queue.pop(0))
 
         if not current_batch:
             await asyncio.sleep(0.001)
@@ -374,6 +399,7 @@ async def scheduler():
                 
                 for _ in range(num_blocks_needed):
                     new_block_id = global_kv_cache.alloc_block()
+                    req.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块
                     req.block_table.append(new_block_id)
 
             else:
@@ -384,6 +410,7 @@ async def scheduler():
                 # 如果现在的block table已经满了，说明之前分配的 KV block 已经用完了，需要再分配一个新的 block 来存储新的 KV
                 if req.seq_len % global_kv_cache.block_size == 0:
                     new_block_id = global_kv_cache.alloc_block()
+                    req.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块
                     req.block_table.append(new_block_id)
             
             
@@ -434,6 +461,8 @@ async def scheduler():
                 for block_id in req.block_table:
                     global_kv_cache.free_block(block_id)
                 req.block_table = []  # 清空 block_table，表示不再占用 KV cache
+                global_kv_cache.release_reserved(req.reserved_blocks)  # 释放预占的 KV block
+                req.reserved_blocks = 0  # 清空预占的 KV block 数量，表示不再需要预占 KV cache 资源
 
        
         # ======================
