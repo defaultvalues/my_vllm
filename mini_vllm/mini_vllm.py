@@ -22,9 +22,6 @@ import uvicorn
 
 class KVCache:
     def __init__(self, num_blocks, num_layers, num_heads, head_dim, block_size, device, dtype):
-        """
-        K_cache 和 V_cache 的维度设计为 [num_layers, num_blocks, num_heads, block_size, head_dim]，方便按 block 存储和访问 KV
-        """
 
         self.num_blocks = num_blocks  # KV cache 的总块数，决定了最大并发请求数和最大序列长度, 一个block存的KV cache一定来自同一个请求
         self.block_size = block_size  # 每块的 token 数量，决定了每块能存储多少 KV
@@ -278,7 +275,7 @@ async def scheduler():
         num_layers=model.config.num_hidden_layers,
         num_heads=model.config.num_key_value_heads,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
-        block_size=16,  # 每块最多存32个 token 的 KV，实际使用中可以根据请求长度动态调整
+        block_size=32,  # 每块最多存32个 token 的 KV，实际使用中可以根据请求长度动态调整
         device=device,
         dtype=model.dtype
     )
@@ -286,7 +283,6 @@ async def scheduler():
     while True:
         # ======================
         # Step 1: 收集新请求
-        # TODO: Admission Control
         # ======================
         try:
             while True:
@@ -295,7 +291,8 @@ async def scheduler():
         except asyncio.TimeoutError:
             pass
 
-        # admission control
+        # Admission control
+        # 调度器发挥作用的地方，判断哪些请求应该在这一次被执行
         while waiting_queue and len(active_requests) < BATCH_SIZE:
             active_requests.append(waiting_queue.pop(0))
 
