@@ -30,6 +30,12 @@ async def main():
         "[INST] How to make a cup of coffee? [/INST]",
         "[INST] Please write a 3-word poem. [/INST]",
         "[INST] What is the capital of France? [/INST]",
+        "[INST] Describe the process of photosynthesis. [/INST]",
+        "[INST] Write a short story about a dragon. [/INST]",
+        "[INST] What are the benefits of exercise? [/INST]",
+        "[INST] How does a computer work? [/INST]",
+        "[INST] What is the meaning of life? [/INST]",
+        "[INST] Can you explain quantum mechanics in simple terms? [/INST]"
     ]
     
     async with httpx.AsyncClient() as client:
