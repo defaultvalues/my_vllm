@@ -384,7 +384,7 @@ async def scheduler():
                     else:  # 要优先保证先加入的已经在decode阶段的请求
                         victim = choose_victim(active_requests)
                         if victim and victim != req:
-                            preempt_request(victim)
+                            preempt_request(victim)  # 还原该请求的状态（但保留已经计算出来的token，等下一轮继续生成后续token），并把它放回 waiting_queue 等待下一次调度
                             active_requests.remove(victim)
                             # 给当前请求分配资源
                             req.reserved_blocks += 1

@@ -86,13 +86,11 @@ POST /generate
 
 ```bash
 # 安装依赖
-pip install torch transformers fastapi uvicorn flashinfer
+uv sync
 
 # 启动服务（需要修改 model_path 为本地路径）
-python mini_vllm/mini_vllm.py
+uv run python mini_vllm/mini_vllm.py
 
-# 发送请求
-curl -X POST http://localhost:8001/generate \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello, who are you?", "max_new_tokens": 50}'
+# 测试输出
+uv run python test_client.py
 ```
