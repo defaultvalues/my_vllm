@@ -12,3 +12,7 @@ wheels/
 mistral-100M/
 
 *.json
+
+mini_vllm/mini_vllm_v0.py
+mini_vllm/block_manager.py 
+flash_attn.py
