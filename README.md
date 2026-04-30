@@ -1,6 +1,6 @@
 # mini-vLLM
 
-一个从零实现的轻量级 LLM 推理引擎，复现了 vLLM 的核心机制，包括 Paged KV Cache、Continuous Batching、Chunked Prefill 以及抢占式调度。以 Mistral-7B 为后端模型，通过 FlashInfer 加速 Attention 计算，并对外暴露兼容 OpenAI 风格的 HTTP 接口。
+一个从零实现的轻量级 LLM 推理引擎，复现了 vLLM 的核心机制，包括 Paged KV Cache、Continuous Batching、Chunked Prefill 以及抢占式调度。以 Mistral-7B 为后端模型，通过 FlashInfer 加速 Attention 计算。
 
 ## 整体架构
 

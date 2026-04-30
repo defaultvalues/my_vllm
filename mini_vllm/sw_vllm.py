@@ -527,7 +527,12 @@ async def scheduler():
         # ======================
         new_active = []
 
-        for i, req in enumerate(active_requests):
+        # 先把没有参与本轮调度的请求原封不动地放回存活队列，等待下一轮调度
+        for req in active_requests:
+            if req not in current_batch:
+                new_active.append(req)
+
+        for i, req in enumerate(current_batch):
             if req.stage == "PREFILL" and req.cursor < len(req.input_ids):
                 # 只是写入了KV cache，还没有产生新的 token 输出，不能更新input_ids，也不能切换到 decode 阶段
                 # 还没有把整个输入送入模型，继续等待下一轮把剩余的输入送入模型
@@ -620,7 +625,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map=None  # 自动分配到双卡
+        device_map=None 
     )
 
     model.eval()
