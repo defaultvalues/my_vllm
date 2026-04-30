@@ -1,5 +1,5 @@
 """
-这一版本希望实现真正的continous batching。
+利用滑动窗口机制减少显存占用。
 """
 
 import asyncio
@@ -16,6 +16,24 @@ from pydantic import BaseModel
 
 import types
 import uvicorn
+
+SLIDING_WINDOW_SIZE = 4096  # 滑动窗口大小，单位是 token，实际使用中可以根据模型的上下文长度和请求长度来调整这个值，达到更好的性能和资源利用率平衡
+
+# ======================
+# 3. 全局请求队列
+# ======================
+request_queue = asyncio.Queue()
+waiting_queue = []
+
+
+# ======================
+# 4. Dynamic Batching Worker
+# ======================
+MAX_REQ_PER_STEP = 8  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+MAX_TOKENS_PER_STEP = 128
+CHUNK_SIZE = 16  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+#TODO: 研究不同的CHUNK_SIZE对性能的影响，是否可以动态调整每个请求的 CHUNK_SIZE 来进一步优化性能，比如根据请求长度或者当前系统负载来调整每个请求这次送入模型的 token 数量，达到更好的延迟和吞吐量平衡
+TIMEOUT = 0.01  # 10ms
 
 # ======================
 # 1. KVCache 管理, 应该放在block manager里吗？
@@ -87,6 +105,9 @@ class InferenceMetadata:
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             self.workspace_buffer, "NHD"
         )
+
+global_kv_cache = None  # 全局 KV cache 对象，供 scheduler 和 attention forward 访问
+inference_metadata = InferenceMetadata()  # 管理 KV cache 相关的推理状态和元信息
 
 
 def flashinfer_attention_forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
@@ -226,14 +247,15 @@ def prepare_metadata(requests, kv_cache, metadata: InferenceMetadata):
         num_kv_heads=model.config.num_key_value_heads, 
         head_dim_qk=model.config.hidden_size // model.config.num_attention_heads,
         page_size=kv_cache.block_size,
-        causal=True
+        causal=True,
+        window_left=4096,
     )
 
 # ======================
 # 2. Request 定义
 # ======================
 class Request:
-    def __init__(self, prompt, max_new_tokens=20):
+    def __init__(self, prompt, max_new_tokens=20, block_size=16):
         self.prompt = prompt
         # 存储为 1D token 序列，便于 pad_sequence 正确对齐不同长度请求
         self.input_ids = tokenizer(prompt, return_tensors="pt").input_ids.squeeze(0).to(device)
@@ -247,14 +269,31 @@ class Request:
  
         self.reserved_blocks = 0 # 预占 KV block，确保调度时有足够的资源，实际分配在 scheduler 中根据 token budget 和 block budget 决定
         
+        self.max_blocks = SLIDING_WINDOW_SIZE // block_size + 1 # 该请求最多占用的 KV block 数量，基于滑动窗口大小和 block 大小计算得出，确保单个请求不会占用过多 KV cache 资源导致其他请求饥饿
+        self.block_size = block_size
         self.block_table = []  # List(int), 存储该请求使用的 block 索引，支持 Prefill + Decode
         self.seq_len = 0  # 当前已生成的总长度（输入 + 输出）
 
         # 控制chunk prefill
         self.cursor = 0  # 当前 prefill 进度
-        self.num_tokens_this_step = 0  # 本次 step 生成的 token 数量，prefill阶段可能一次生成多个 token，decode阶段通常是1
+        self.num_tokens_this_step = 0  # 本次 step 生成的 token 数量，prefill阶段可能一次生成多个 token，decode阶段是1
 
         self.window_offset = 0  # 用于实现 sliding window，表示当前输入窗口相对于整个输入的偏移，实际使用中可能不需要这个字段，或者需要根据具体的 sliding window 实现来调整
+    
+    def get_logical_block_table(self):
+        """
+        返回该请求的逻辑 block table，考虑到滑动窗口机制可能导致的循环覆写问题，确保返回的 block table 是按照正确的时序逻辑顺序排列的
+        """
+        num_blocks = (self.seq_len + self.block_size - 1) // self.block_size
+
+        if num_blocks <= self.max_blocks:
+            return self.block_table
+        else:
+            # 发生了循环覆写，计算最老的逻辑块在哪里
+            oldest_logical_block = num_blocks - self.max_blocks
+            start_idx = oldest_logical_block % self.max_blocks
+            # 更新滑动窗的起始位置
+            return self.block_table[start_idx:] + self.block_table[:start_idx]
 
     def step(self, next_token):
         self.generated.append(next_token.item())
@@ -262,28 +301,8 @@ class Request:
             self.finished = True
 
     def get_output(self):
-        return tokenizer.decode(self.generated)
+        return tokenizer.decode(self.generated, skip_special_tokens=True)
 
-
-
-
-# ======================
-# 3. 全局请求队列
-# ======================
-request_queue = asyncio.Queue()
-waiting_queue = []
-
-global_kv_cache = None  # 全局 KV cache 对象，供 scheduler 和 attention forward 访问
-inference_metadata = InferenceMetadata()  # 管理 KV cache 相关的推理状态和元信息
-
-# ======================
-# 4. Dynamic Batching Worker
-# ======================
-MAX_REQ_PER_STEP = 8  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
-MAX_TOKENS_PER_STEP = 128
-CHUNK_SIZE = 16  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
-#TODO: 研究不同的CHUNK_SIZE对性能的影响，是否可以动态调整每个请求的 CHUNK_SIZE 来进一步优化性能，比如根据请求长度或者当前系统负载来调整每个请求这次送入模型的 token 数量，达到更好的延迟和吞吐量平衡
-TIMEOUT = 0.01  # 10ms
 
 
 def preempt_request(req: Request):
@@ -307,13 +326,15 @@ def preempt_request(req: Request):
     waiting_queue.insert(0, req)  # 抢占的请求放回 waiting_queue 的最前面，优先被调度
 
 def choose_victim(active_requests):
-    # TODO: 设计合理的抢占策略，当前的策略是优先抢占 prefill 阶段的请求，因为它们还没有产生输出，抢占成本较低；decode 阶段的请求已经开始产生输出了，抢占成本较高，所以只有在没有 prefill 请求可抢占时才考虑抢占 decode 请求
+    """
+    当前的策略是优先抢占 prefill 阶段的请求，因为它们还没有产生输出，抢占成本较低；decode 阶段的请求已经开始产生输出了，抢占成本较高，所以只有在没有 prefill 请求可抢占时才考虑抢占 decode 请求
+    """
     # 1. 优先抢 prefill
     prefill_reqs = [r for r in active_requests if r.stage == "PREFILL"]
     if prefill_reqs:
         return max(prefill_reqs, key=lambda r: len(r.block_table))
 
-    # 2. fallback：抢 decode（必须！）
+    # 2. fallback：抢 decode
     decode_reqs = [r for r in active_requests if not r.finished]
     if decode_reqs:
         return max(decode_reqs, key=lambda r: len(r.block_table))
@@ -326,7 +347,7 @@ async def scheduler():
     active_requests = []
 
     global_kv_cache = KVCache(
-        num_blocks=64,  # 假设最多支持16个并发请求（每个请求最多使用一个 block，实际可以更灵活）
+        num_blocks=512,  # 假设最多支持16个并发请求（每个请求最多使用一个 block，实际可以更灵活）
         num_layers=model.config.num_hidden_layers,
         num_heads=model.config.num_key_value_heads,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
@@ -353,7 +374,7 @@ async def scheduler():
 
             req = waiting_queue[0]
 
-            prompt_required_blocks = (len(req.input_ids) + global_kv_cache.block_size - 1) // global_kv_cache.block_size
+            prompt_required_blocks = (len(req.input_ids) + global_kv_cache.block_size - 1) // global_kv_cache.block_size  # 预估这个请求的输入需要占用的 KV block 数量，注意这里是基于输入长度来预估的，实际占用可能会因为 sliding window 的机制而有所不同，但总的原则是先预占足够的 KV block 来保证调度器能够接受这个请求，后续在执行过程中根据实际情况调整 KV block 的分配和释放
 
             if global_kv_cache.available_blocks() >= prompt_required_blocks:  # 只要够prefill就放进来
                 active_requests.append(waiting_queue.pop(0))
@@ -374,29 +395,37 @@ async def scheduler():
         # 首先调度正在处理中的请求
         for req in active_requests:
             # 首先确保所有的decode的请求都能被调度到
-            if req.stage == "DECODE":
+            if req.stage == "DECODE" and token_budget > 0:
                 if req.seq_len % global_kv_cache.block_size == 0:  # 需要分配新的 KV block 了
-                    if global_kv_cache.available_blocks() > 0:
-                        # 为该请求多预留一个block
-                        req.reserved_blocks += 1
-                        global_kv_cache.reserve(1) # 全局预留池减1
-                        token_budget -= 1  # decode阶段每个请求每轮只生成一个 token
-                        req.num_tokens_this_step = 1
-                        current_batch.append(req)
-                    else:  # 要优先保证先加入的已经在decode阶段的请求
-                        victim = choose_victim(active_requests)
-                        if victim and victim != req:
-                            preempt_request(victim)  # 还原该请求的状态（但保留已经计算出来的token，等下一轮继续生成后续token），并把它放回 waiting_queue 等待下一次调度
-                            active_requests.remove(victim)
-                            # 给当前请求分配资源
+                    if len(req.block_table) < req.max_blocks:
+                        # 说明块数还没有达到上限，因此需要物理上分配新的块
+                        if global_kv_cache.available_blocks() > 0:
+                            # 为该请求多预留一个block
                             req.reserved_blocks += 1
                             global_kv_cache.reserve(1) # 全局预留池减1
                             token_budget -= 1  # decode阶段每个请求每轮只生成一个 token
                             req.num_tokens_this_step = 1
                             current_batch.append(req)
-                        else:
-                            # 没有可抢占的请求了，只能先放弃调度这个请求了，等下一轮再试
-                            continue
+                        else:  # 要优先保证先加入的已经在decode阶段的请求
+                            victim = choose_victim(active_requests)
+                            if victim and victim != req:
+                                preempt_request(victim)  # 还原该请求的状态（但保留已经计算出来的token，等下一轮继续生成后续token），并把它放回 waiting_queue 等待下一次调度
+                                active_requests.remove(victim)
+                                # 给当前请求分配资源
+                                req.reserved_blocks += 1
+                                global_kv_cache.reserve(1) # 全局预留池减1
+                                token_budget -= 1  # decode阶段每个请求每轮只生成一个 token
+                                req.num_tokens_this_step = 1
+                                current_batch.append(req)
+                            else:
+                                # 没有可抢占的请求了，只能先放弃调度这个请求了，等下一轮再试
+                                continue
+                    
+                    else: 
+                        # 虽然逻辑上要分配新块，但是利用滑动窗机制，并不需要物理上分配新块
+                        token_budget -= 1  # decode阶段每个请求每轮只生成一个 token
+                        req.num_tokens_this_step = 1
+                        current_batch.append(req)
 
                 else:  # 不用分配新的 block 了，直接生成下一个 token 就行
                     token_budget -= 1  # decode阶段每个请求每轮只生成一个 token
@@ -415,10 +444,13 @@ async def scheduler():
                 cur_chunk = min(remaining, token_budget, CHUNK_SIZE)  # 每次最多处理 CHUNK_SIZE 个 token，避免单个请求占用过多资源导致其他请求饥饿
 
                 # 检查是否要分配新的 KV block，如果要分配了但显存不够了，这个请求也只能等下一轮了
-                num_blocks_needed = (req.seq_len + cur_chunk + global_kv_cache.block_size - 1) // global_kv_cache.block_size \
-                    - len(req.block_table)
+                num_blocks_needed = (req.seq_len + cur_chunk + global_kv_cache.block_size - 1) // global_kv_cache.block_size - len(req.block_table)
+                # 理论上一共要这么多块
+                
                 if num_blocks_needed > free_blocks:
                     continue  # 显存不够了，这个请求只能等下一轮了
+
+                # 这里不需要分配新的reserved blocks，因为admission control的时候已经分配了
 
                 req.num_tokens_this_step = cur_chunk  
                 token_budget -= cur_chunk
@@ -448,12 +480,11 @@ async def scheduler():
                 position_ids_list.append(torch.arange(req.cursor, req.cursor + cur_chunk, dtype=torch.long, device=device))
                 req.cursor += cur_chunk  # 更新 cursor，表示已经送入了这么多输入
 
-                # print(num_new_tokens)
-
                 # 根据新的输入长度，计算需要分配多少 KV block，并更新请求的 block table
-                num_blocks_needed = (req.seq_len + cur_chunk + global_kv_cache.block_size - 1) // global_kv_cache.block_size \
-                    - len(req.block_table)  # 计算当前请求需要的总块数，减去已经分配的块数，得到还需要分配的块数
+                num_blocks_needed = (req.seq_len + cur_chunk + global_kv_cache.block_size - 1) // global_kv_cache.block_size - len(req.block_table)
+                # 计算当前请求需要的总块数，减去已经分配的块数，得到还需要分配的块数
                 
+                # prefill阶段，为了保证结果的准确性，不考虑截断
                 for _ in range(num_blocks_needed):
                     new_block_id = global_kv_cache.alloc_block()
                     req.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块
@@ -465,11 +496,14 @@ async def scheduler():
                 req.cursor += 1  # decode阶段 cursor 的作用不大，可以简单地每次加1，表示已经送入了一个新的 token
                 
                 # 如果现在的block table已经满了，说明之前分配的 KV block 已经用完了，需要再分配一个新的 block 来存储新的 KV
+                # 只有当块的数量没有达到上限时，才需要分配真实的block，否则就复用原来的block
                 if req.seq_len % global_kv_cache.block_size == 0:
-                    new_block_id = global_kv_cache.alloc_block()
-                    req.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块
-                    req.block_table.append(new_block_id)
-            
+                    if len(req.block_table) < req.max_blocks: 
+                        new_block_id = global_kv_cache.alloc_block()
+                        req.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块
+                        req.block_table.append(new_block_id)
+                    else:
+                        req.block_table.append(req.block_table.pop(0))  # TODO: 可以考虑将 block table 变成双端队列减少pop的开销
             
             req.seq_len += req.num_tokens_this_step  # 更新 seq_len，表示已经填充了这么多 KV，只是声明占用，实际写入会在 attention forward 中完成
 
@@ -497,10 +531,23 @@ async def scheduler():
             if req.stage == "PREFILL" and req.cursor < len(req.input_ids):
                 # 只是写入了KV cache，还没有产生新的 token 输出，不能更新input_ids，也不能切换到 decode 阶段
                 # 还没有把整个输入送入模型，继续等待下一轮把剩余的输入送入模型
+                while len(req.block_table) > req.max_blocks:
+                    old_block = req.block_table.pop(0)
+                    global_kv_cache.free_block(old_block)
+                
                 new_active.append(req)
+                
                 continue
             
-            req.stage = "DECODE"  # 只有当整个输入都送入模型后才切换到 decode 阶段
+            # 只有当整个输入都送入模型后才切换到 decode 阶段
+            # ====== 【SW 新增：垃圾回收】 ======
+            if req.stage == "PREFILL":  # 刚刚完成整个 Prompt 的输入
+                req.stage = "DECODE"
+                
+                # 历史使命完成！一次性截断超出滑动窗口范围的老块，释放显存
+                while len(req.block_table) > req.max_blocks:
+                    old_block = req.block_table.pop(0)
+                    global_kv_cache.free_block(old_block)
 
             last_token_idx = inference_metadata.qo_indptr[i + 1] - 1  # 每个请求最后一个 token 的位置
             logits = all_logits[last_token_idx]  # 取出对应位置的 logits

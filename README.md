@@ -30,6 +30,10 @@ Scheduler (async loop)
 - 每个请求维护一张 `block_table`，记录该请求占用的 Block 索引列表
 - 支持 **Block 预占（reserve）** 机制：在请求被调度前提前预留显存，避免推理中途 OOM
 
+#### 1.1 滑动窗口下的KV Cache
+
+滑动窗口机制可以确保每个请求占用的显存存在上界，从而保证显存不会被单个请求占满。因此我们可以利用这一点不断回收请求占用的KV Cache。
+
 ### 2. Attention 替换（`flashinfer_attention_forward`）
 
 用 **monkey patch** 的方式替换 HuggingFace Mistral 模型每一层的 `self_attn.forward`，将标准的 `nn.MultiheadAttention` 替换为基于 FlashInfer 的 Paged Attention：
