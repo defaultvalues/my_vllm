@@ -4,21 +4,7 @@
 
 ## 整体架构
 
-```
-HTTP 请求
-    │
-    ▼
-FastAPI Server (/generate)
-    │  将请求放入 asyncio.Queue
-    ▼
-Scheduler (async loop)
-    ├── Admission Control（准入控制）
-    ├── 调度决策（Prefill / Decode / 抢占）
-    └── 模型推理（HF model + FlashInfer Attention）
-          │
-          ▼
-      KVCache（Paged Block Pool）
-```
+![my_vllm_structure](./figures/vllm.png)
 
 ## 核心模块
 
