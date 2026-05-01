@@ -6,21 +6,26 @@
 
 ![my_vllm_structure](./figures/vllm.png)
 
-## 核心模块
 
-### 1. KV Cache 管理（`KVCache`）
+## 1. KV Cache 管理
 
-采用 **Paged KV Cache** 设计，将显存划分为固定大小的 Block（默认 `block_size=16`），每个 Block 存储若干 token 的 KV 向量。
+采用 **Paged KV Cache** 设计，将显存划分为固定大小的 Block（默认 `block_size=16`），即每个 Block 最多可以存储16个来自统一请求的 Token 对应的 KV Cache。
 
 - 全局 Cache 张量形状：`[num_layers, num_blocks, 2, block_size, num_kv_heads, head_dim]`
 - 每个请求维护一张 `block_table`，记录该请求占用的 Block 索引列表
 - 支持 **Block 预占（reserve）** 机制：在请求被调度前提前预留显存，避免推理中途 OOM
 
-#### 1.1 滑动窗口下的KV Cache
+### 1.1 KV Cache 结构示意图
 
-滑动窗口机制可以确保每个请求占用的显存存在上界，从而保证显存不会被单个请求占满。因此我们可以利用这一点不断回收请求占用的KV Cache。
+![](./figures/kv_cache.svg)
 
-### 2. Attention 替换（`flashinfer_attention_forward`）
+### 1.2 滑动窗口下的KV Cache
+
+滑动窗口机制可以确保每个请求占用的 KV Cache block 存在上界，利用这一点可以让显存不会无休止上涨。当某个请求在decode阶段的需要的block数量超过这一上界时，我们采用循环的方式复用旧显存块：
+![](./figures/sliding_window.svg)
+
+
+## 2. 支持 Continous Batching 的推理内核
 
 用 **monkey patch** 的方式替换 HuggingFace Mistral 模型每一层的 `self_attn.forward`，将标准的 `nn.MultiheadAttention` 替换为基于 FlashInfer 的 Paged Attention：
 
@@ -28,14 +33,14 @@
 2. 调用 `flashinfer.append_paged_kv_cache` 将新 KV 写入全局 Block Pool
 3. 调用 `flashinfer.BatchPrefillWithPagedKVCacheWrapper.run` 完成 Attention 计算
 
-### 3. 调度器（`scheduler`）
+## 3. 调度器（`scheduler`）
 
 异步 `while True` 循环，每轮执行以下步骤：
 
-#### Step 1 — 准入控制（Admission Control）
+### Step 1 — 准入控制（Admission Control）
 从 `waiting_queue` 中取出请求，只要剩余 Block 数量足以覆盖该请求的 Prefill 长度，就将其移入 `active_requests` 并预占对应 Block。
 
-#### Step 2 — 调度决策
+### Step 2 — 调度决策
 在 `token_budget`（默认 128 tokens/step）的约束下：
 
 - **Decode 请求优先**：确保已经在生成阶段的请求每轮都能获得 1 个 token 的预算
@@ -43,7 +48,14 @@
 - **抢占（Preemption）**：若 Decode 请求无法获得新 Block，调度器会选择"代价最小"的受害者（优先抢占 Prefill 请求，其次 Decode 请求）释放其 Block，保证高优先级请求继续执行
 
 #### Step 3 — 推理与采样
-将当前 batch 的所有 token 拼接为单个序列送入模型（`input_ids` 形状 `[1, total_tokens]`），通过 `InferenceMetadata` 中的 `qo_indptr` 还原每个请求的边界，按 greedy 策略采样下一个 token。
+
+将当前 batch 的所有 token 拼接为单个序列送入模型。
+
+### Request 生命周期示意
+
+在上面的调度逻辑下，每个请求的从到达到完成可能历经如下几个阶段：
+
+![](./figures/request_life_cycle.png)
 
 ### 4. 推理元信息（`InferenceMetadata`）
 
@@ -57,22 +69,9 @@
 | `qo_indptr` | 每个请求的 Query token 在拼接序列中的起止偏移 |
 | `batch_indices` / `positions` | 每个 token 对应的请求编号及位置编码索引 |
 
-### 5. HTTP 接口
-
-基于 FastAPI，在 `8001` 端口提供：
-
-```
-POST /generate
-{
-  "prompt": "...",
-  "max_new_tokens": 20
-}
-```
-
-请求放入异步队列后轮询完成，返回生成文本。
 
 
-## 快速上手
+## 测试代码
 
 ```bash
 # 安装依赖

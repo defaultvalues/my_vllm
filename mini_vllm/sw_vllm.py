@@ -29,14 +29,14 @@ waiting_queue = []
 # ======================
 # 4. Dynamic Batching Worker
 # ======================
-MAX_REQ_PER_STEP = 8  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+MAX_REQ_PER_STEP = 4  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
 MAX_TOKENS_PER_STEP = 128
-CHUNK_SIZE = 16  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+CHUNK_SIZE = 8  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
 #TODO: 研究不同的CHUNK_SIZE对性能的影响，是否可以动态调整每个请求的 CHUNK_SIZE 来进一步优化性能，比如根据请求长度或者当前系统负载来调整每个请求这次送入模型的 token 数量，达到更好的延迟和吞吐量平衡
 TIMEOUT = 0.01  # 10ms
 
 # ======================
-# 1. KVCache 管理, 应该放在block manager里吗？
+# 1. KVCache 管理
 # ======================
 
 class KVCache:
@@ -84,7 +84,7 @@ class KVCache:
 
 class InferenceMetadata:
     """
-    统一管理KV cache相关的推理状态和元信息, 方便未来扩展更多功能(如分布式、FlashInfer 直接调用等)
+    统一管理KV cache相关的推理状态和元信息
     """
     def __init__(self):
         self.is_decode = False
