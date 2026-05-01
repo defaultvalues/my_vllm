@@ -4,6 +4,7 @@
 
 import asyncio
 import math
+import json
 import torch
 import flashinfer
 
@@ -13,6 +14,7 @@ from transformers.models.mistral.modeling_mistral import MistralRotaryEmbedding 
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 import types
 import uvicorn
@@ -29,8 +31,8 @@ waiting_queue = []
 # ======================
 # 4. Dynamic Batching Worker
 # ======================
-MAX_REQ_PER_STEP = 4  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
-MAX_TOKENS_PER_STEP = 128
+MAX_REQ_PER_STEP = 16  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+MAX_TOKENS_PER_STEP = 1024
 CHUNK_SIZE = 8  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
 #TODO: 研究不同的CHUNK_SIZE对性能的影响，是否可以动态调整每个请求的 CHUNK_SIZE 来进一步优化性能，比如根据请求长度或者当前系统负载来调整每个请求这次送入模型的 token 数量，达到更好的延迟和吞吐量平衡
 TIMEOUT = 0.01  # 10ms
@@ -279,6 +281,7 @@ class Request:
         self.num_tokens_this_step = 0  # 本次 step 生成的 token 数量，prefill阶段可能一次生成多个 token，decode阶段是1
 
         self.window_offset = 0  # 用于实现 sliding window，表示当前输入窗口相对于整个输入的偏移，实际使用中可能不需要这个字段，或者需要根据具体的 sliding window 实现来调整
+        self.stream_queue = asyncio.Queue()  # 流式输出通道，scheduler 每步产出 token 后写入
     
     def get_logical_block_table(self):
         """
@@ -347,7 +350,7 @@ async def scheduler():
     active_requests = []
 
     global_kv_cache = KVCache(
-        num_blocks=512,  # 假设最多支持16个并发请求（每个请求最多使用一个 block，实际可以更灵活）
+        num_blocks=512, 
         num_layers=model.config.num_hidden_layers,
         num_heads=model.config.num_key_value_heads,
         head_dim=model.config.hidden_size // model.config.num_attention_heads,
@@ -557,7 +560,17 @@ async def scheduler():
             last_token_idx = inference_metadata.qo_indptr[i + 1] - 1  # 每个请求最后一个 token 的位置
             logits = all_logits[last_token_idx]  # 取出对应位置的 logits
             next_token = torch.argmax(logits, dim=-1)  # 简单 greedy 采样，后续可以替换为更复杂的采样策略
+            token_id = int(next_token.item())
             req.step(next_token)
+
+            # 将每一步生成的 token 推送给流式接口，不改变 scheduler 的调度决策。
+            req.stream_queue.put_nowait(
+                {
+                    "type": "token",
+                    "token_id": token_id,
+                    "text": tokenizer.decode([token_id], skip_special_tokens=False),
+                }
+            )
 
             req.input_ids = torch.cat(
                 [req.input_ids, next_token.view(1)], dim=0
@@ -572,6 +585,12 @@ async def scheduler():
                 req.block_table = []  # 清空 block_table，表示不再占用 KV cache
                 global_kv_cache.release_reserved(req.reserved_blocks)  # 释放预占的 KV block
                 req.reserved_blocks = 0  # 清空预占的 KV block 数量，表示不再需要预占 KV cache 资源
+                req.stream_queue.put_nowait(
+                    {
+                        "type": "done",
+                        "output": req.get_output(),
+                    }
+                )
 
        
         # ======================
@@ -603,6 +622,26 @@ async def generate(req: GenerateRequest):
         await asyncio.sleep(0.01)
 
     return {"output": r.get_output()}
+
+
+@app.post("/generate_stream")
+async def generate_stream(req: GenerateRequest):
+    r = Request(req.prompt, req.max_new_tokens)
+    await request_queue.put(r)
+
+    async def event_generator():
+        while True:
+            event = await r.stream_queue.get()
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if event.get("type") == "done":
+                break
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
 
 
 # ======================
