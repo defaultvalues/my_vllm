@@ -18,6 +18,7 @@ PROMPTS = [
     "[INST] 请用两句话介绍一下你自己。[/INST]",
     "[INST] What is the capital of France? Answer in one sentence. [/INST]",
     "[INST] Explain black holes to a 10-year-old in 3 bullet points. [/INST]",
+    "Provide a step-by-step guide to installing Ubuntu.",
 ]
 
 

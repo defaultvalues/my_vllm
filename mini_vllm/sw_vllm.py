@@ -31,9 +31,9 @@ waiting_queue = []
 # ======================
 # 4. Dynamic Batching Worker
 # ======================
-MAX_REQ_PER_STEP = 16  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
-MAX_TOKENS_PER_STEP = 1024
-CHUNK_SIZE = 8  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+# MAX_REQ_PER_STEP = 16  # 每轮调度最多处理的请求数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
+MAX_TOKENS_PER_STEP = 64
+CHUNK_SIZE = 16  # 每次处理的 token 数量，过大可能增加延迟，过小可能降低吞吐量，实际使用中可以根据请求长度动态调整
 #TODO: 研究不同的CHUNK_SIZE对性能的影响，是否可以动态调整每个请求的 CHUNK_SIZE 来进一步优化性能，比如根据请求长度或者当前系统负载来调整每个请求这次送入模型的 token 数量，达到更好的延迟和吞吐量平衡
 TIMEOUT = 0.01  # 10ms
 
@@ -181,7 +181,7 @@ def flashinfer_attention_forward(self, hidden_states, position_embeddings, atten
 
     
     # === 关键修复：将结果填充回原始形状 ===
-    out_valid_reshaped = out_valid.reshape(-1, self.config.hidden_size).unsqueeze(0)  # [Total_Tokens, Hidden_Size]
+    out_valid_reshaped = out_valid.reshape(-1, self.config.hidden_size).unsqueeze(0)  # [1, Total_Tokens, Hidden_Size]
     # output = torch.zeros((bsz, q_len, self.config.hidden_size), device=device, dtype=out_valid.dtype)
     
     # offset = 0
@@ -191,7 +191,7 @@ def flashinfer_attention_forward(self, hidden_states, position_embeddings, atten
     #     output[i, :valid_len] = out_valid_reshaped[offset: offset + valid_len]
     #     offset += valid_len
     
-    # 恢复形状为 [B, S, Hidden_Size]
+    # 恢复形状为 [B, Total_Tokens, Hidden_Size]
     return self.o_proj(out_valid_reshaped), None
 
 def prepare_metadata(requests, kv_cache, metadata: InferenceMetadata):
@@ -263,6 +263,9 @@ class Request:
         self.input_ids = tokenizer(prompt, return_tensors="pt").input_ids.squeeze(0).to(device)
         self.generated = []
         self.max_new_tokens = max_new_tokens
+
+        # print(f"New request: {prompt}, input length: {len(self.input_ids)}, max_new_tokens: {max_new_tokens}")
+
         self.finished = False
 
         self.stage = "PREFILL"  # or DECODE, 实现Prefill + Decode分阶段处理
@@ -318,6 +321,7 @@ def preempt_request(req: Request):
         req.reserved_blocks = 0
     for block_id in req.block_table:
         global_kv_cache.free_block(block_id)
+    
     req.block_table = []
     req.seq_len = 0
     req.cursor = 0
@@ -412,8 +416,11 @@ async def scheduler():
                         else:  # 要优先保证先加入的已经在decode阶段的请求
                             victim = choose_victim(active_requests)
                             if victim and victim != req:
+                                # print(f"Preempting request with prompt: {victim.prompt}, reserved blocks: {victim.reserved_blocks}, block table: {victim.block_table}")
                                 preempt_request(victim)  # 还原该请求的状态（但保留已经计算出来的token，等下一轮继续生成后续token），并把它放回 waiting_queue 等待下一次调度
+                                
                                 active_requests.remove(victim)
+                                current_batch.remove(victim) if victim in current_batch else None  # 如果被抢占的请求已经在当前 batch 里了，需要把它移除，确保当前 batch 不包含被抢占的请求
                                 # 给当前请求分配资源
                                 req.reserved_blocks += 1
                                 global_kv_cache.reserve(1) # 全局预留池减1
@@ -458,6 +465,8 @@ async def scheduler():
                 req.num_tokens_this_step = cur_chunk  
                 token_budget -= cur_chunk
                 current_batch.append(req)
+        
+        # print(f"Active requests: {len(active_requests)}, Current batch size: {len(current_batch)}, Token budget left: {token_budget}, Available KV blocks: {global_kv_cache.available_blocks()}")
 
 
         if not current_batch:
@@ -506,7 +515,7 @@ async def scheduler():
                         req.reserved_blocks -= 1  # 刚刚分配了一个块，减少一个预占的块
                         req.block_table.append(new_block_id)
                     else:
-                        req.block_table.append(req.block_table.pop(0))  # TODO: 可以考虑将 block table 变成双端队列减少pop的开销
+                        req.block_table.append(req.block_table.pop(0))  
             
             req.seq_len += req.num_tokens_this_step  # 更新 seq_len，表示已经填充了这么多 KV，只是声明占用，实际写入会在 attention forward 中完成
 
@@ -539,9 +548,9 @@ async def scheduler():
             if req.stage == "PREFILL" and req.cursor < len(req.input_ids):
                 # 只是写入了KV cache，还没有产生新的 token 输出，不能更新input_ids，也不能切换到 decode 阶段
                 # 还没有把整个输入送入模型，继续等待下一轮把剩余的输入送入模型
-                while len(req.block_table) > req.max_blocks:
-                    old_block = req.block_table.pop(0)
-                    global_kv_cache.free_block(old_block)
+                # while len(req.block_table) > req.max_blocks:
+                #     old_block = req.block_table.pop(0)
+                #     global_kv_cache.free_block(old_block)
                 
                 new_active.append(req)
                 
@@ -553,9 +562,9 @@ async def scheduler():
                 req.stage = "DECODE"
                 
                 # 历史使命完成！一次性截断超出滑动窗口范围的老块，释放显存
-                while len(req.block_table) > req.max_blocks:
-                    old_block = req.block_table.pop(0)
-                    global_kv_cache.free_block(old_block)
+                # while len(req.block_table) > req.max_blocks:
+                #     old_block = req.block_table.pop(0)
+                #     global_kv_cache.free_block(old_block)
 
             last_token_idx = inference_metadata.qo_indptr[i + 1] - 1  # 每个请求最后一个 token 的位置
             logits = all_logits[last_token_idx]  # 取出对应位置的 logits

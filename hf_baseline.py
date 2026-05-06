@@ -52,7 +52,7 @@ waiting_queue =[]
 # ======================
 # 4. Static/Dynamic Batching Worker
 # ======================
-BATCH_SIZE = 16
+BATCH_SIZE = 4
 TIMEOUT = 0.01  # 10ms
 
 async def scheduler_hf():
